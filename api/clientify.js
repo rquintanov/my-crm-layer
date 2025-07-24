@@ -10,4 +10,3 @@ export async function findContactByEmail(email) { /* ... */ }
 export async function createContact(data) { /* ... */ }
 export async function createDeal(data) { /* ... */ }
 export async function addNote(data) { /* ... */ }
-
