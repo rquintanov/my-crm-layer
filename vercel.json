@@ -1,6 +1,0 @@
-{
-  "functions": { "api/*.ts": { "runtime": "vercel-node@4.0.0" } },
-  "routes": [
-    { "src": "/elevenlabs/webhook", "dest": "/api/elevenlabs-webhook.ts" }
-  ]
-}
