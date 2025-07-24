@@ -1,17 +1,34 @@
 // api/elevenlabs-webhook.js
 // ──────────────────────────────────────────────────────────────
 // Webhook ElevenLabs → Clientify (todo en un solo archivo)
-// Requiere:
-//   - CLIENTIFY_TOKEN  (obligatorio)  → Vercel > Settings > Env Vars
-//   - ELEVENLABS_SECRET (opcional)    → para validar que el webhook viene de ElevenLabs
-// ----------------------------------------------------------------
+// Requiere (cuando NO estás en dry-run):
+//   - CLIENTIFY_TOKEN  → Vercel > Settings > Environment Variables
+// Opcional:
+//   - ELEVENLABS_SECRET → para validar que el webhook viene de ElevenLabs
+//   - DRY_RUN=true      → para no llamar a Clientify (eco de parámetros)
+//
+// Puedes activar el dry-run también con:
+//   - Query param:  ?dryRun=1
+//   - Header:       x-dry-run: true
+// ──────────────────────────────────────────────────────────────
 
 import axios from "axios";
 
-// ---------- Configuración Clientify ----------
+// ---------- Utilidades ----------
+function isDryRun(req) {
+  return (
+    process.env.DRY_RUN === "true" ||
+    req.query?.dryRun === "1" ||
+    req.headers["x-dry-run"] === "true"
+  );
+}
+
+// ---------- Config Clientify ----------
+const CLIENTIFY_BASE = "https://api.clientify.com/api/v1";
 const CLIENTIFY_TOKEN = process.env.CLIENTIFY_TOKEN;
+
 const clientify = axios.create({
-  baseURL: "https://api.clientify.com/api/v1",
+  baseURL: CLIENTIFY_BASE,
   headers: { Authorization: `Token ${CLIENTIFY_TOKEN}` },
   timeout: 15000
 });
@@ -24,12 +41,13 @@ async function findContactBy(field, value) {
 }
 
 async function createContact({ name, email, phone, source, tags = [] }) {
-  const res = await clientify.post("/contacts/", {
+  const payload = {
     name,
     email,
     phone,
-    tags: ["AI_Agent", source].filter(Boolean).concat(tags)
-  });
+    tags: ["AI_Agent", source].filter(Boolean).concat(tags || [])
+  };
+  const res = await clientify.post("/contacts/", payload);
   return res.data;
 }
 
@@ -43,11 +61,11 @@ async function createDeal({ name, contactId, stage = 1 }) {
 }
 
 async function addNote({ contactId, content }) {
-  // Ajusta si tu instancia usa otro endpoint para notas
+  // Ajusta si tu instancia usa otro recurso para notas
   return clientify.post("/notes/", { content, contact: contactId });
 }
 
-// ---------- Validaciones básicas ----------
+// ---------- Validaciones ----------
 function validateEnvelope(body) {
   if (!body || typeof body !== "object") return "Body vacío o no es JSON";
   const { type, intent, payload } = body;
@@ -58,20 +76,22 @@ function validateEnvelope(body) {
 }
 
 function validateCreateLeadPayload(p) {
-  if (!p.name) return "Falta 'name'";
-  if (!p.email && !p.phone) return "Debes enviar al menos 'email' o 'phone'";
+  if (!p?.name) return "Falta 'name' en payload";
+  if (!p.email && !p.phone)
+    return "Debes enviar al menos 'email' o 'phone' en payload";
   return null;
 }
 
-// ---------- Handler ----------
+// ---------- Handler principal ----------
 export default async function handler(req, res) {
   try {
-    // Método
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Use POST" });
     }
 
-    // Secret opcional
+    const dryRun = isDryRun(req);
+
+    // Validación de secret opcional
     if (process.env.ELEVENLABS_SECRET) {
       const incoming = req.headers["x-elevenlabs-secret"];
       if (incoming !== process.env.ELEVENLABS_SECRET) {
@@ -79,19 +99,29 @@ export default async function handler(req, res) {
       }
     }
 
-    // Token obligatorio
-    if (!CLIENTIFY_TOKEN) {
-      return res.status(500).json({ error: "CLIENTIFY_TOKEN no está definido" });
-    }
-
     const body = req.body;
-    console.log("Evento recibido:", JSON.stringify(body));
-
-    // Validación general
+    console.log("Evento recibido:", JSON.stringify(body, null, 2));
     const envError = validateEnvelope(body);
     if (envError) return res.status(400).json({ error: envError });
 
     const { intent, payload } = body;
+
+    // Si estamos en dry-run devolvemos eco y salimos
+    if (dryRun) {
+      return res.status(200).json({
+        ok: true,
+        mode: "dry-run",
+        intent,
+        received: payload
+      });
+    }
+
+    // A partir de aquí, se llama a Clientify
+    if (!CLIENTIFY_TOKEN) {
+      return res
+        .status(500)
+        .json({ error: "CLIENTIFY_TOKEN no está definido" });
+    }
 
     switch (intent) {
       case "create_lead": {
@@ -100,9 +130,10 @@ export default async function handler(req, res) {
 
         const { name, email, phone, summary, source, tags } = payload;
 
-        // 1. Buscar contacto por email, si no, por phone
-        let contact = (email && await findContactBy("email", email)) ||
-                      (phone && await findContactBy("phone", phone));
+        // 1. Buscar contacto existente
+        let contact =
+          (email && (await findContactBy("email", email))) ||
+          (phone && (await findContactBy("phone", phone)));
 
         // 2. Crear si no existe
         if (!contact) {
@@ -135,42 +166,18 @@ export default async function handler(req, res) {
         });
     }
   } catch (err) {
-    console.error("ERROR:", err.response?.status, err.response?.data || err.message, err.stack);
+    console.error(
+      "ERROR:",
+      err.response?.status,
+      err.response?.config?.url,
+      err.response?.data || err.message,
+      err.stack
+    );
     return res.status(500).json({
       error: "Clientify integration failed",
+      status: err.response?.status,
+      url: err.response?.config?.url,
       details: err.response?.data || err.message
     });
-  }
-}
-// ... imports y config iguales
-
-const DRY_RUN =
-  process.env.DRY_RUN === "true" ||  // ① desde env var
-  (typeof req !== "undefined" && (   // req existe solo dentro del handler
-    req.query?.dryRun === "1" ||     // ② query ?dryRun=1
-    req.headers["x-dry-run"] === "true" // ③ header
-  ));
-
-export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
-
-    // ... secret check ...
-
-    const body = req.body;
-    console.log("Evento recibido:", JSON.stringify(body));
-
-    // 👉 Antes de llamar a Clientify:
-    if (DRY_RUN) {
-      return res.status(200).json({
-        ok: true,
-        mode: "dry-run",
-        received: body
-      });
-    }
-
-    // ... resto de lógica real (findContact/createContact/etc.)
-  } catch (err) {
-    // ...
   }
 }
