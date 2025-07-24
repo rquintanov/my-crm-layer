@@ -142,3 +142,35 @@ export default async function handler(req, res) {
     });
   }
 }
+// ... imports y config iguales
+
+const DRY_RUN =
+  process.env.DRY_RUN === "true" ||  // ① desde env var
+  (typeof req !== "undefined" && (   // req existe solo dentro del handler
+    req.query?.dryRun === "1" ||     // ② query ?dryRun=1
+    req.headers["x-dry-run"] === "true" // ③ header
+  ));
+
+export default async function handler(req, res) {
+  try {
+    if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
+
+    // ... secret check ...
+
+    const body = req.body;
+    console.log("Evento recibido:", JSON.stringify(body));
+
+    // 👉 Antes de llamar a Clientify:
+    if (DRY_RUN) {
+      return res.status(200).json({
+        ok: true,
+        mode: "dry-run",
+        received: body
+      });
+    }
+
+    // ... resto de lógica real (findContact/createContact/etc.)
+  } catch (err) {
+    // ...
+  }
+}
