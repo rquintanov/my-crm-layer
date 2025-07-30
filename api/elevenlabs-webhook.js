@@ -5,18 +5,15 @@
 // ✅ Acepta dos formatos de entrada:
 //    1) Con sobre completo:
 //       { type:"intent_detected", intent:"create_lead", payload:{ name, email, ... } }
-//    2) Plano (lo que ElevenLabs te está enviando ahora):
+//    2) Plano (lo que ElevenLabs puede enviar):
 //       { name, email, phone, summary, ... }
 //
-// ✅ Modo DRY-RUN (no llama a Clientify) activable por:
-//    - Env var  DRY_RUN=true  (en Vercel)
-//    - Query    ?dryRun=1
-//    - Header   x-dry-run: true
+// ✅ DRY-RUN: desactivado por defecto si no tienes DRY_RUN=true ni ?dryRun=1 ni x-dry-run:true
+// 🔐 Secret opcional en header: x-elevenlabs-secret
 //
-// 🔐 Opcional: valida un secret en header x-elevenlabs-secret
-//
-// ⚠️ Necesitas en Vercel:
-//    CLIENTIFY_TOKEN  (obligatorio para llamadas reales)
+// ⚠️ Token:
+//    - Usamos process.env.CLIENTIFY_TOKEN
+//    - Fallback SOLO PARA PRUEBAS con tu token pegado. ELIMÍNALO LUEGO.
 //
 // ──────────────────────────────────────────────────────────────
 
@@ -31,27 +28,12 @@ function isDryRun(req) {
   );
 }
 
-// Envolver payload plano a formato estándar
 function wrapIfFlat(raw) {
   if (!raw || typeof raw !== "object") return raw;
-
-  // si ya viene correcto, devuélvelo
   if (raw.payload && raw.type && raw.intent) return raw;
 
-  // si vienen datos "sueltos" en raíz, los empaquetamos
   if (raw.name || raw.email || raw.phone) {
-    const {
-      name,
-      email,
-      phone,
-      summary,
-      source,
-      tags,
-      intent,
-      type,
-      ...rest
-    } = raw;
-
+    const { name, email, phone, summary, source, tags, intent, type, ...rest } = raw;
     return {
       type: type || "intent_detected",
       intent: intent || "create_lead",
@@ -66,17 +48,28 @@ function wrapIfFlat(raw) {
       ...rest
     };
   }
-
   return raw;
 }
 
 // =============== Config Clientify ==============================
 const CLIENTIFY_BASE = "https://api.clientify.com/api/v1";
-const CLIENTIFY_TOKEN = process.env.CLIENTIFY_TOKEN;
+
+// ⚠️ Fallback con tu token SOLO para pruebas locales.
+//    Si la env var existe, se usa la env var.
+//    Elimina el fallback antes de dejarlo definitivo.
+const RAW_TOKEN = (process.env.CLIENTIFY_TOKEN ?? "62c037ea6bef52b2297bf655ab7fdf72ee528e4a");
+
+// Saneo: quita comillas, CR/LF y espacios
+const CLEAN_TOKEN = String(RAW_TOKEN)
+  .replace(/^['"]|['"]$/g, "")
+  .replace(/[\r\n]/g, "")
+  .trim();
+
+const AUTH_HEADER = `Token ${CLEAN_TOKEN}`;
 
 const clientify = axios.create({
   baseURL: CLIENTIFY_BASE,
-  headers: { Authorization: `Token ${CLIENTIFY_TOKEN}` },
+  headers: { Authorization: AUTH_HEADER },
   timeout: 15000
 });
 
@@ -143,14 +136,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // Body original
+    // Body
     let body = req.body;
     console.log("Evento recibido (raw):", JSON.stringify(body));
-
-    // Envolver si vino plano
     body = wrapIfFlat(body);
 
-    // Dry-run antes de forzar validaciones estrictas
+    // Dry-run temprano
     const dryRun = isDryRun(req);
     if (dryRun) {
       return res.status(200).json({
@@ -167,13 +158,10 @@ export default async function handler(req, res) {
 
     const { intent, payload } = body;
 
-    if (!CLIENTIFY_TOKEN) {
-      return res
-        .status(500)
-        .json({ error: "CLIENTIFY_TOKEN no está definido" });
+    if (!CLEAN_TOKEN) {
+      return res.status(500).json({ error: "CLIENTIFY_TOKEN no está definido" });
     }
 
-    // Router de intents
     switch (intent) {
       case "create_lead": {
         const pError = validateCreateLeadPayload(payload);
@@ -181,32 +169,42 @@ export default async function handler(req, res) {
 
         const { name, email, phone, summary, source, tags } = payload;
 
-        // 1. Buscar contacto
+        // 1) Buscar contacto
         let contact =
           (email && (await findContactBy("email", email))) ||
           (phone && (await findContactBy("phone", phone)));
 
-        // 2. Crear si no existe
+        // 2) Crear si no existe
         if (!contact) {
           contact = await createContact({ name, email, phone, source, tags });
         }
 
-        // 3. Crear deal
-        const deal = await createDeal({
-          name: `Lead de ${name}`,
-          contactId: contact.id,
-          stage: 1
-        });
-
-        // 4. Nota opcional
-        if (summary) {
-          await addNote({ contactId: contact.id, content: summary });
+        // 3) Crear deal (si falla por stage, no abortamos toda la operación)
+        let deal = null;
+        try {
+          deal = await createDeal({
+            name: `Lead de ${name}`,
+            contactId: contact.id,
+            stage: 1 // Ajusta al ID de stage válido en tu pipeline
+          });
+        } catch (e) {
+          console.warn("⚠️ Fallo creando deal:", e.response?.status, e.response?.data || e.message);
         }
 
+        // 4) Nota opcional
+        if (summary) {
+          try {
+            await addNote({ contactId: contact.id, content: summary });
+          } catch (e) {
+            console.warn("⚠️ Fallo creando nota:", e.response?.status, e.response?.data || e.message);
+          }
+        }
+
+        console.log("CREADO:", { contactId: contact.id, dealId: deal?.id || null });
         return res.status(200).json({
           ok: true,
           contactId: contact.id,
-          dealId: deal.id
+          dealId: deal?.id || null
         });
       }
 
@@ -232,4 +230,3 @@ export default async function handler(req, res) {
     });
   }
 }
-
