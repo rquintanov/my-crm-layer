@@ -264,7 +264,8 @@ export default async function handler(req, res) {
           ninos: kidsNum,
           urgencia: urgencia_compra
         });
-
+		
+        console.log("✅ contact", contact?.id);
         return res.status(200).json({
           ok: true,
           base: CLIENTIFY_BASE,
