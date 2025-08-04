@@ -1,8 +1,8 @@
-// api/elevenlabs-webhook.js
-// ElevenLabs → Clientify  (api.clientify.net/v1)
-// Crea SIEMPRE un contacto nuevo, añade nota con datos de crucero y actualiza
-// campos personalizados (si se configuraron IDs).
-
+/****************************************************************
+*  ElevenLabs → Clientify
+*  Crea SIEMPRE un contacto nuevo, añade nota y campos
+*  personalizados, y crea un Deal asociado en el stage indicado.
+****************************************************************/
 import axios from "axios";
 
 /* ───────────── Utilidades generales ───────────── */
@@ -18,7 +18,6 @@ function wrapIfFlat(raw) {
   if (!raw || typeof raw !== "object") return raw;
   if (raw.payload && raw.type && raw.intent) return raw;
 
-  // Formato plano → lo envolvemos
   if (raw.name || raw.email || raw.phone || raw.last_name) {
     const {
       name, last_name, email, phone,
@@ -26,9 +25,8 @@ function wrapIfFlat(raw) {
       destino_crucero, fecha_crucero, adultos, ninos, urgencia_compra,
       intent, type, ...rest
     } = raw;
-
     return {
-      type: type   || "intent_detected",
+      type  : type   || "intent_detected",
       intent: intent || "create_lead",
       payload: {
         name, last_name, email, phone, summary, source, tags,
@@ -41,37 +39,30 @@ function wrapIfFlat(raw) {
 }
 
 function splitName(full = "", last = "") {
-  if (last) return { first_name: String(full || "").trim(), last_name: String(last).trim() };
-  const parts = String(full || "").trim().split(/\s+/);
-  if (parts.length <= 1) return { first_name: parts[0] || "", last_name: "" };
-  return { first_name: parts[0], last_name: parts.slice(1).join(" ") };
+  if (last) return { first_name: String(full).trim(), last_name: String(last).trim() };
+  const parts = String(full).trim().split(/\s+/);
+  return parts.length > 1
+    ? { first_name: parts[0], last_name: parts.slice(1).join(" ") }
+    : { first_name: parts[0] || "", last_name: "" };
 }
 
-function normalizeInt(v) {
-  if (v === undefined || v === null || v === "") return undefined;
-  const n = Number(String(v).replace(/[^\d.-]/g, ""));
-  return Number.isFinite(n) ? n : undefined;
-}
+const normalizeInt = (v) => (v === undefined || v === null || v === "" ? undefined :
+  (n => Number.isFinite(n) ? n : undefined)(Number(String(v).replace(/[^\d.-]/g, ""))));
 
-function cleanDate(v) {
-  if (!v) return undefined;
-  return String(v).trim();           // deja la fecha como string (Clientify lo guarda tal cual)
-}
+const cleanDate = (v) => v ? String(v).trim() : undefined;
 
 /* ───────────── Config Clientify ───────────── */
 const CLIENTIFY_BASE = process.env.CLIENTIFY_BASE_URL?.trim() || "https://api.clientify.net/v1";
-
-const RAW_TOKEN   = process.env.CLIENTIFY_TOKEN || "";
-const CLEAN_TOKEN = String(RAW_TOKEN).replace(/^['"]|['"]$/g, "").replace(/[\r\n]/g, "").trim();
+const TOKEN = (process.env.CLIENTIFY_TOKEN || "").replace(/[\r\n'"]/g, "").trim();
 
 const clientify = axios.create({
   baseURL: CLIENTIFY_BASE,
-  headers: { Authorization: `Token ${CLEAN_TOKEN}`, Accept: "application/json" },
+  headers: { Authorization: `Token ${TOKEN}`, Accept: "application/json" },
   timeout: 15000,
   validateStatus: () => true
 });
 
-// IDs de campos personalizados (opcionales)
+// Custom-field IDs opcionales
 const CF_IDS = {
   destino : process.env.CLIENTIFY_CF_DESTINO_ID  || "",
   fecha   : process.env.CLIENTIFY_CF_FECHA_ID    || "",
@@ -80,9 +71,8 @@ const CF_IDS = {
   urgencia: process.env.CLIENTIFY_CF_URGENCIA_ID || ""
 };
 
-/* ───────────── Helpers Clientify ───────────── */
+/* ───────────── Helpers Contact ───────────── */
 async function createContact({ first_name, last_name, email, phone, source, tags = [], summary }) {
-  // asegúrate de que tags es SIEMPRE array
   const safeTags =
     Array.isArray(tags)
       ? tags
@@ -100,171 +90,161 @@ async function createContact({ first_name, last_name, email, phone, source, tags
     summary: summary || ""
   };
 
-  const res = await clientify.post("/contacts/", body);
-  if (res.status >= 200 && res.status < 300) return res.data;
-
-  throw new Error(`createContact → ${res.status} ${JSON.stringify(res.data)}`);
+  const r = await clientify.post("/contacts/", body);
+  if (r.status >= 200 && r.status < 300) return r.data;
+  throw new Error(`createContact → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-async function addNote(contactId, content) {
-  if (!content) return;
-  const body = { name: "Datos del Agente", comment: content };
-  const res  = await clientify.post(`/contacts/${contactId}/note/`, body);
-  if (res.status >= 200 && res.status < 300) return res.data;
-
-  console.warn("addNote WARN →", res.status, res.data);
-}
-
-async function updateCustomFields(contactId, { destino, fecha, adultos, ninos, urgencia }) {
-  const entries = [
-    { id: CF_IDS.destino,  value: destino  },
-    { id: CF_IDS.fecha,    value: fecha    },
-    { id: CF_IDS.adultos,  value: adultos  },
-    { id: CF_IDS.ninos,    value: ninos    },
-    { id: CF_IDS.urgencia, value: urgencia }
-  ].filter(e => e.id && e.value !== undefined && e.value !== null && e.value !== "");
-
-  if (entries.length === 0) return;
-
-  // forma habitual
-  const res1 = await clientify.patch(`/contacts/${contactId}/`, {
-    custom_fields: entries.map(e => ({ custom_field: e.id, value: String(e.value) }))
-  });
-  if (res1.status >= 200 && res1.status < 300) return res1.data;
-
-  // alternativa
-  await clientify.patch(`/contacts/${contactId}/`, {
-    custom_fields_values: entries.map(e => ({ id: e.id, value: String(e.value) }))
+/* ───────────── Nota ───────────── */
+async function addNote(contactId, text) {
+  if (!text) return;
+  await clientify.post(`/contacts/${contactId}/note/`, {
+    name: "Datos del Agente",
+    comment: text
   });
 }
 
-/* ───────────── Validación ───────────── */
+/* ───────────── Campos personalizados ───────────── */
+async function updateCustomFields(contactId, map) {
+  const entries = Object.entries(map)
+    .map(([k, v]) => ({ id: CF_IDS[k], value: v }))
+    .filter(e => e.id && e.value !== undefined && e.value !== null && e.value !== "");
+
+  if (!entries.length) return;
+
+  const payload = { custom_fields_values: entries.map(e => ({ id: e.id, value: String(e.value) })) };
+  await clientify.patch(`/contacts/${contactId}/`, payload);
+}
+
+/* ───────────── Deal helper ───────────── */
+async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
+  const body = {
+    name,
+    contact: contactId,
+    stage: stageId,
+    amount,
+    expected_close_date: fecha || null
+  };
+  const r = await clientify.post("/deals/", body);
+  if (r.status >= 200 && r.status < 300) return r.data;
+  throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
+}
+
+/* ───────────── Validaciones ───────────── */
 function validateEnvelope(b) {
-  if (!b || typeof b !== "object")                      return "Body vacío o no es JSON";
-  if (b.type !== "intent_detected")                     return "type debe ser 'intent_detected'";
-  if (!b.intent)                                        return "Falta 'intent'";
-  if (!b.payload || typeof b.payload !== "object")      return "Falta 'payload'";
+  if (!b || typeof b !== "object")            return "Body vacío o no es JSON";
+  if (b.type !== "intent_detected")           return "type debe ser 'intent_detected'";
+  if (!b.intent)                              return "Falta 'intent'";
+  if (!b.payload || typeof b.payload !== "object") return "Falta 'payload'";
   return null;
 }
 
-function validateCreateLeadPayload(p) {
-  if (!p?.name && !p?.first_name) return "Falta 'name' o 'first_name' en payload";
-  if (!p.email && !p.phone)       return "Debes enviar al menos 'email' o 'phone'";
+function validateLeadPayload(p) {
+  if (!p?.name && !p?.first_name) return "Falta 'name' o 'first_name'";
+  if (!p.email && !p.phone)       return "Debes enviar 'email' o 'phone'";
   return null;
 }
 
 /* ───────────── Handler ───────────── */
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST")
-      return res.status(405).json({ error: "Use POST" });
+    if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
+    if (!TOKEN) return res.status(500).json({ error: "CLIENTIFY_TOKEN no definido" });
 
-    if (!CLEAN_TOKEN)
-      return res.status(500).json({ error: "CLIENTIFY_TOKEN no está definido" });
-
-    // Validación simple de firma (si la configuraste)
-    if (process.env.ELEVENLABS_SECRET) {
-      const incoming = req.headers["x-elevenlabs-secret"];
-      if (incoming !== process.env.ELEVENLABS_SECRET)
-        return res.status(401).json({ error: "Invalid signature" });
+    // Firma simple (opcional)
+    if (process.env.ELEVENLABS_SECRET &&
+        req.headers["x-elevenlabs-secret"] !== process.env.ELEVENLABS_SECRET) {
+      return res.status(401).json({ error: "Invalid signature" });
     }
 
-    // Envuelve payload plano, si llega
     const envelope = wrapIfFlat(req.body);
-
-    // Dry-run inmediato
     if (isDryRun(req)) {
-      return res.status(200).json({
-        ok   : true,
-        mode : "dry-run",
-        intent   : envelope.intent ?? "unknown",
-        received : envelope.payload ?? envelope
-      });
+      return res.status(200).json({ ok: true, mode: "dry-run", received: envelope });
     }
 
-    // Validación básica
-    const err = validateEnvelope(envelope);
-    if (err) return res.status(400).json({ error: err });
+    const envErr = validateEnvelope(envelope);
+    if (envErr) return res.status(400).json({ error: envErr });
 
     const { intent, payload } = envelope;
-
-    /* ---------- INTENT: create_lead ---------- */
-    if (intent === "create_lead") {
-      const pErr = validateCreateLeadPayload(payload);
-      if (pErr) return res.status(400).json({ error: pErr });
-
-      const {
-        name, last_name, email, phone, summary, source, tags,
-        destino_crucero, fecha_crucero, adultos, ninos, urgencia_compra
-      } = payload;
-
-      // Nombre / apellidos
-      const { first_name, last_name: ln } = splitName(name, last_name);
-
-      // ➜ SIEMPRE CREAR UN CONTACTO NUEVO
-      const contact = await createContact({
-        first_name,
-        last_name: ln,
-        email,
-        phone,
-        source,
-        tags,
-        summary
-      });
-
-      // Nota con info de crucero
-      const adultsNum = normalizeInt(adultos);
-      const kidsNum   = normalizeInt(ninos);
-      const fechaNorm = cleanDate(fecha_crucero);
-
-      const nota =
-        `Datos del lead:\n` +
-        (destino_crucero ? `- Destino crucero: ${destino_crucero}\n` : "") +
-        (fechaNorm ? `- Fecha crucero: ${fechaNorm}\n` : "") +
-        (adultsNum !== undefined ? `- Adultos: ${adultsNum}\n` : "") +
-        (kidsNum   !== undefined ? `- Niños: ${kidsNum}\n`   : "") +
-        (urgencia_compra ? `- Urgencia de compra: ${urgencia_compra}\n` : "") +
-        (summary ? `- Resumen: ${summary}\n` : "");
-
-      if (nota.trim() !== "Datos del lead:") {
-        await addNote(contact.id, nota);
-      }
-
-      // Campos personalizados
-      await updateCustomFields(contact.id, {
-        destino  : destino_crucero,
-        fecha    : fechaNorm,
-        adultos  : adultsNum,
-        ninos    : kidsNum,
-        urgencia : urgencia_compra
-      });
-
-      console.log("✅ contact", contact.id);
-      return res.status(200).json({
-        ok   : true,
-        base : CLIENTIFY_BASE,
-        contactId : contact.id
-      });
+    if (intent !== "create_lead") {
+      return res.status(200).json({ ok: true, message: `Intent '${intent}' no implementado` });
     }
 
-    /* ---------- Otros intents ---------- */
-    return res.status(200).json({ ok: true, message: `Intent '${intent}' no implementado` });
+    const pErr = validateLeadPayload(payload);
+    if (pErr) return res.status(400).json({ error: pErr });
+
+    /* ─── Crear contacto ─── */
+    const {
+      name, last_name, email, phone, summary, source, tags,
+      destino_crucero, fecha_crucero, adultos, ninos, urgencia_compra
+    } = payload;
+
+    const { first_name, last_name: ln } = splitName(name, last_name);
+
+    const contact = await createContact({
+      first_name,
+      last_name: ln,
+      email,
+      phone,
+      source,
+      tags,
+      summary
+    });
+
+    /* ─── Nota ─── */
+    const nota =
+      `Datos del lead:\n` +
+      (destino_crucero ? `- Destino crucero: ${destino_crucero}\n` : "") +
+      (fecha_crucero   ? `- Fecha crucero: ${fecha_crucero}\n`   : "") +
+      (adultos ? `- Adultos: ${adultos}\n` : "") +
+      (ninos   ? `- Niños: ${ninos}\n`     : "") +
+      (urgencia_compra ? `- Urgencia de compra: ${urgencia_compra}\n` : "") +
+      (summary ? `- Resumen: ${summary}\n` : "");
+
+    await addNote(contact.id, nota);
+
+    /* ─── Campos personalizados ─── */
+    await updateCustomFields(contact.id, {
+      destino  : destino_crucero,
+      fecha    : fecha_crucero,
+      adultos,
+      ninos,
+      urgencia : urgencia_compra
+    });
+
+    /* ─── Deal ─── */
+    const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
+    if (stageId) {
+      const amount = process.env.DEFAULT_DEAL_AMOUNT
+        ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
+      const dealName = `Crucero: ${destino_crucero || "Destino"} · ${fecha_crucero || "Fecha"}`;
+
+      const deal = await createDeal({
+        contactId: contact.id,
+        name: dealName,
+        amount,
+        stageId,
+        fecha: fecha_crucero
+      });
+      console.log("✅ deal", deal.id);
+    } else {
+      console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
+    }
+
+    console.log("✅ contact", contact.id);
+    return res.status(200).json({ ok: true, base: CLIENTIFY_BASE, contactId: contact.id });
 
   } catch (e) {
-    console.error(
-      "ERROR",
-      e.response?.status,
-      e.response?.config?.url,
-      e.response?.data || e.message
-    );
+    console.error("ERROR", e.response?.status, e.response?.config?.url, e.response?.data || e.message);
     return res.status(500).json({
-      error   : "Clientify integration failed",
-      status  : e.response?.status,
-      url     : e.response?.config?.url,
-      details : e.response?.data || e.message
+      error: "Clientify integration failed",
+      status: e.response?.status,
+      url   : e.response?.config?.url,
+      details: e.response?.data || e.message
     });
   }
 }
+
 
 
 
