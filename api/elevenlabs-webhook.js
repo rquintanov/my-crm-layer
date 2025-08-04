@@ -118,17 +118,22 @@ async function updateCustomFields(contactId, map) {
 
 /* ───────────── Deal helper ───────────── */
 async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
+  // 👉 Clientify quiere la URL del contacto, no el número
+  const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
+
   const body = {
     name,
-    contact: contactId,
-    stage: stageId,
-    amount,
+    contact: contactUrl,   // ← aquí el cambio
+    stage  : stageId,
+    amount ,
     expected_close_date: fecha || null
   };
+
   const r = await clientify.post("/deals/", body);
   if (r.status >= 200 && r.status < 300) return r.data;
   throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
 }
+
 
 /* ───────────── Validaciones ───────────── */
 function validateEnvelope(b) {
