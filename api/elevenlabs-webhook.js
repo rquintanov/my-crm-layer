@@ -1,9 +1,9 @@
 /****************************************************************
 * ElevenLabs → Clientify
 * - Crea SIEMPRE un contacto nuevo, añade nota y campos
-* - Asigna propietario al CONTACTO
-* - Crea Deal (intentando ya con owner) y refuerza por PATCH si hace falta
-* - Verifica por GET el owner final en contacto y deal y lo devuelve
+* - Asigna propietario al CONTACTO (verificado)
+* - Crea Deal SIN owner (hereda del contacto) y, si hace falta, PATCH (verificado)
+* - Responde con los owners efectivos y trazas de depuración
 ****************************************************************/
 import axios from "axios";
 
@@ -98,7 +98,6 @@ async function createContact({ first_name, last_name, email, phone, source, tags
   throw new Error(`createContact → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-/* Nota */
 async function addNote(contactId, text) {
   if (!text) return;
   await clientify.post(`/contacts/${contactId}/note/`, {
@@ -107,7 +106,6 @@ async function addNote(contactId, text) {
   });
 }
 
-/* Campos personalizados */
 async function updateCustomFields(contactId, map) {
   const entries = Object.entries(map)
     .map(([k, v]) => ({ id: CF_IDS[k], value: v }))
@@ -129,89 +127,25 @@ function pickByHash(contactId, agentIds) {
   return agentIds[n % agentIds.length];
 }
 
-/* ───────────── Deal & Owner helpers ───────────── */
-// Crea deal; si admite owner en POST, lo incluimos
-async function createDealWithOptionalOwner({ contactId, name, amount = 0, stageId, fecha, ownerUserId }) {
-  const base = CLIENTIFY_BASE.replace(/\/$/, "");
-  const contactUrl = `${base}/contacts/${contactId}/`;
-  const ownerUrl   = ownerUserId ? `${base}/users/${ownerUserId}/` : undefined;
+/* ───────────── Owner helpers ───────────── */
 
-  const body = {
-    name,
-    contact: contactUrl,
-    stage  : stageId,
-    amount,
-    expected_close_date: fecha || null,
-    ...(ownerUrl ? { owner: ownerUrl } : {})
-  };
-
-  const r = await clientify.post("/deals/", body);
-  if (r.status >= 200 && r.status < 300) return r.data;
-
-  // Reintenta sin owner si el POST con owner no es aceptado
-  if ([400,403,404,409,422].includes(r.status) && ownerUrl) {
-    const r2 = await clientify.post("/deals/", {
-      name, contact: contactUrl, stage: stageId, amount, expected_close_date: fecha || null
-    });
-    if (r2.status >= 200 && r2.status < 300) return r2.data;
+// Comprueba que el usuario existe
+async function userExists(userId) {
+  try {
+    const r = await clientify.get(`/users/${userId}/`);
+    return r.status >= 200 && r.status < 300;
+  } catch {
+    return false;
   }
-  throw new Error(`createDealWithOptionalOwner → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-// PATCH deal (owner/user + url/id)
-async function assignOwnerToDeal(dealId, ownerUserId) {
-  const base = CLIENTIFY_BASE.replace(/\/$/, "");
-  const ownerUrl = `${base}/users/${ownerUserId}/`;
-  const attempts = [
-    { key: "owner", value: ownerUrl, valueType: "url" },
-    { key: "user",  value: ownerUrl, valueType: "url" },
-    { key: "owner", value: Number(ownerUserId), valueType: "id" },
-    { key: "user",  value: Number(ownerUserId), valueType: "id" }
-  ];
-  const tried = [];
-  for (const a of attempts) {
-    try {
-      const r = await clientify.patch(`/deals/${dealId}/`, { [a.key]: a.value });
-      tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
-      if (r.status >= 200 && r.status < 300) return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
-    } catch (e) {
-      tried.push({ key: a.key, valueType: a.valueType, status: e.response?.status || null, data: e.response?.data || e.message });
-    }
-  }
-  return { ok: false, tried, winner: null };
-}
-
-// PATCH contacto (owner/user + url/id)
-async function assignOwnerToContact(contactId, ownerUserId) {
-  const base = CLIENTIFY_BASE.replace(/\/$/, "");
-  const ownerUrl = `${base}/users/${ownerUserId}/`;
-  const attempts = [
-    { key: "owner", value: ownerUrl, valueType: "url" },
-    { key: "user",  value: ownerUrl, valueType: "url" },
-    { key: "owner", value: Number(ownerUserId), valueType: "id" },
-    { key: "user",  value: Number(ownerUserId), valueType: "id" }
-  ];
-  const tried = [];
-  for (const a of attempts) {
-    try {
-      const r = await clientify.patch(`/contacts/${contactId}/`, { [a.key]: a.value });
-      tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
-      if (r.status >= 200 && r.status < 300) return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
-    } catch (e) {
-      tried.push({ key: a.key, valueType: a.valueType, status: e.response?.status || null, data: e.response?.data || e.message });
-    }
-  }
-  return { ok: false, tried, winner: null };
-}
-
-// Lectores owner (parsean varias formas posibles)
+// Extrae owner id de un objeto devuelto por la API
 function extractOwnerIdFromObj(obj) {
-  // intenta "owner", "user", "assigned_to", "owner_id", "user_id", objeto con url o id, o string URL
   const cand = obj?.owner ?? obj?.user ?? obj?.assigned_to ?? obj?.owner_id ?? obj?.user_id ?? null;
   if (typeof cand === "number") return String(cand);
   if (typeof cand === "string") {
     const m = cand.match(/\/users\/(\d+)\/?$/);
-    return m ? m[1] : ( /^\d+$/.test(cand) ? cand : null );
+    return m ? m[1] : (/^\d+$/.test(cand) ? cand : null);
   }
   if (cand && typeof cand === "object") {
     if (typeof cand.id === "number" || typeof cand.id === "string") return String(cand.id);
@@ -222,15 +156,60 @@ function extractOwnerIdFromObj(obj) {
   }
   return null;
 }
-async function readDealOwner(dealId) {
-  const r = await clientify.get(`/deals/${dealId}/`);
-  const ownerId = (r.status >= 200 && r.status < 300) ? extractOwnerIdFromObj(r.data || {}) : null;
-  return { ownerId, rawKeys: Object.keys(r.data || {}) };
-}
+
 async function readContactOwner(contactId) {
   const r = await clientify.get(`/contacts/${contactId}/`);
-  const ownerId = (r.status >= 200 && r.status < 300) ? extractOwnerIdFromObj(r.data || {}) : null;
-  return { ownerId, rawKeys: Object.keys(r.data || {}) };
+  return { ownerId: (r.status>=200 && r.status<300) ? extractOwnerIdFromObj(r.data||{}) : null, raw: r.data };
+}
+async function readDealOwner(dealId) {
+  const r = await clientify.get(`/deals/${dealId}/`);
+  return { ownerId: (r.status>=200 && r.status<300) ? extractOwnerIdFromObj(r.data||{}) : null, raw: r.data };
+}
+
+// PATCH genérico: prueba varias claves/formatos y verifica por GET
+async function assignOwnerVerified({ kind, id, targetOwnerId, readFn }) {
+  const base = CLIENTIFY_BASE.replace(/\/$/, "");
+  const ownerUrl = `${base}/users/${targetOwnerId}/`;
+
+  // Orden pensado para Clientify: primero owner_id numérico
+  const attempts = [
+    { key: "owner_id", value: Number(targetOwnerId), valueType: "id" },
+    { key: "owner",    value: Number(targetOwnerId), valueType: "id" },
+    { key: "user_id",  value: Number(targetOwnerId), valueType: "id" },
+    { key: "user",     value: Number(targetOwnerId), valueType: "id" },
+    { key: "owner",    value: ownerUrl,              valueType: "url" },
+    { key: "user",     value: ownerUrl,              valueType: "url" }
+  ];
+
+  const tried = [];
+  for (const a of attempts) {
+    try {
+      const r = await clientify.patch(`/${kind}/${id}/`, { [a.key]: a.value });
+      tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
+      // tras cualquier 2xx, verificamos por GET; si no queda, seguimos
+      if (r.status >= 200 && r.status < 300) {
+        await sleep(250);
+        const read = await readFn(id);
+        if (read.ownerId === String(targetOwnerId)) {
+          return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
+        }
+      }
+    } catch (e) {
+      tried.push({ key: a.key, valueType: a.valueType, status: e.response?.status || null, data: e.response?.data || e.message });
+    }
+  }
+  return { ok: false, tried, winner: null };
+}
+
+/* ───────────── Deal helpers ───────────── */
+
+// Crea el deal SIN owner; la herencia del contacto evita reglas que pisen el owner
+async function createDealNoOwner({ contactId, name, amount = 0, stageId, fecha }) {
+  const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
+  const body = { name, contact: contactUrl, stage: stageId, amount, expected_close_date: fecha || null };
+  const r = await clientify.post("/deals/", body);
+  if (r.status >= 200 && r.status < 300) return r.data;
+  throw new Error(`createDealNoOwner → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
 /* ───────────── Validaciones ───────────── */
@@ -253,7 +232,6 @@ export default async function handler(req, res) {
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
     if (!TOKEN) return res.status(500).json({ error: "CLIENTIFY_TOKEN no definido" });
 
-    // Firma simple (opcional)
     if (process.env.ELEVENLABS_SECRET &&
         req.headers["x-elevenlabs-secret"] !== process.env.ELEVENLABS_SECRET) {
       return res.status(401).json({ error: "Invalid signature" });
@@ -293,7 +271,6 @@ export default async function handler(req, res) {
       summary
     });
 
-    /* Nota y CF */
     const nota =
       `Datos del lead:\n` +
       (destino_crucero ? `- Destino crucero: ${destino_crucero}\n` : "") +
@@ -312,67 +289,93 @@ export default async function handler(req, res) {
       urgencia : urgencia_compra
     });
 
-    /* ─── Reparto: elegimos owner antes de todo ─── */
+    /* ─── Reparto ─── */
     const agentIds = getAgentIds();
     const intendedOwnerId = agentIds.length ? pickByHash(contact.id, agentIds) : null;
 
-    /* ─── Asignar owner al CONTACTO primero ─── */
-    let contactAssign = null, contactOwnerAfter = null;
-    if (intendedOwnerId) {
-      contactAssign = await assignOwnerToContact(contact.id, intendedOwnerId);
-      await sleep(250);
-      contactOwnerAfter = await readContactOwner(contact.id);
+    // Valida que el usuario exista; si no, gira al siguiente
+    let chosenOwner = intendedOwnerId;
+    if (chosenOwner) {
+      let idx = agentIds.indexOf(String(chosenOwner));
+      let loops = 0;
+      while (loops < agentIds.length && !(await userExists(chosenOwner))) {
+        idx = (idx + 1) % agentIds.length;
+        chosenOwner = agentIds[idx];
+        loops++;
+      }
+      if (loops >= agentIds.length) chosenOwner = null; // ninguno válido
     }
 
-    /* ─── Crear DEAL e intentar owner en POST ─── */
+    /* ─── Asignar owner al CONTACTO (verificado) ─── */
+    let contactAssign = null, contactOwner = null;
+    if (chosenOwner) {
+      contactAssign = await assignOwnerVerified({
+        kind: "contacts",
+        id: contact.id,
+        targetOwnerId: chosenOwner,
+        readFn: readContactOwner
+      });
+      await sleep(250);
+      contactOwner = await readContactOwner(contact.id);
+    } else {
+      contactOwner = await readContactOwner(contact.id);
+    }
+
+    /* ─── Crear DEAL SIN owner (herencia) ─── */
     const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
-    let deal = null, dealOwnerAfter = null, patchAfterPost = null;
+    let deal = null, dealOwner = null, dealPatch = null;
 
     if (stageId) {
       const amount = process.env.DEFAULT_DEAL_AMOUNT ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
       const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
 
-      deal = await createDealWithOptionalOwner({
+      deal = await createDealNoOwner({
         contactId: contact.id,
         name: dealName,
         amount,
         stageId,
-        fecha: cleanDate(fecha_crucero),
-        ownerUserId: intendedOwnerId || undefined
+        fecha: cleanDate(fecha_crucero)
       });
 
       await sleep(300);
-      dealOwnerAfter = await readDealOwner(deal.id);
+      dealOwner = await readDealOwner(deal.id);
 
-      if (intendedOwnerId && (!dealOwnerAfter.ownerId || dealOwnerAfter.ownerId !== String(intendedOwnerId))) {
-        patchAfterPost = await assignOwnerToDeal(deal.id, intendedOwnerId);
+      // Si no heredó o heredó otro, reforzamos con PATCH verificado
+      if (chosenOwner && dealOwner.ownerId !== String(chosenOwner)) {
+        dealPatch = await assignOwnerVerified({
+          kind: "deals",
+          id: deal.id,
+          targetOwnerId: chosenOwner,
+          readFn: readDealOwner
+        });
         await sleep(300);
-        dealOwnerAfter = await readDealOwner(deal.id);
+        dealOwner = await readDealOwner(deal.id);
       }
     } else {
       console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
     }
 
-    /* ─── Respuesta ─── */
+    /* ─── Respuesta ───────────── */
     return res.status(200).json({
       ok: true,
       base: CLIENTIFY_BASE,
       contactId: contact.id,
       dealId: deal?.id || null,
 
-      // RESULTADO EFECTIVO (lo que realmente quedó)
-      contactOwnerId: contactOwnerAfter?.ownerId || null,
-      dealOwnerId: dealOwnerAfter?.ownerId || null,
+      // Propietarios efectivos
+      contactOwnerId: contactOwner?.ownerId || null,
+      dealOwnerId: dealOwner?.ownerId || null,
 
-      // info del asignado previsto (hash)
-      intendedOwnerId,
+      // Reparto previsto y elegido
+      intendedOwnerId: intendedOwnerId || null,
+      chosenOwnerId: chosenOwner || null,
 
-      // trazas para depurar automatizaciones
+      // Trazas útiles
       debug: {
         contactAssign,
-        contactOwnerAfter,
-        dealReadKeys: dealOwnerAfter?.rawKeys || null,
-        dealPatch: patchAfterPost || null
+        contactOwnerAfter: contactOwner,
+        dealPatch: dealPatch,
+        dealOwnerAfter: dealOwner
       }
     });
 
