@@ -1,9 +1,9 @@
 /****************************************************************
 * ElevenLabs → Clientify
 * - Crea SIEMPRE un contacto nuevo, añade nota y campos
-* - Asigna propietario al CONTACTO (verificado)
-* - Crea Deal SIN owner (hereda del contacto) y, si hace falta, PATCH (verificado)
-* - Responde con los owners efectivos y trazas de depuración
+* - Asigna propietario por EMAIL (owner) al CONTACTO (verificado)
+* - Crea Deal y lo asigna por EMAIL (owner) si hace falta (verificado)
+* - Devuelve owner efectivo (id + email + nombre) y trazas
 ****************************************************************/
 import axios from "axios";
 
@@ -116,7 +116,7 @@ async function updateCustomFields(contactId, map) {
   await clientify.patch(`/contacts/${contactId}/`, payload);
 }
 
-/* ───────────── Reparto de agentes ───────────── */
+/* ───────────── Reparto ───────────── */
 function getAgentIds() {
   const raw = (process.env.CLIENTIFY_AGENT_USER_IDS || "").trim();
   return raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : [];
@@ -127,70 +127,76 @@ function pickByHash(contactId, agentIds) {
   return agentIds[n % agentIds.length];
 }
 
-/* ───────────── Owner helpers ───────────── */
-
-// Comprueba que el usuario existe
-async function userExists(userId) {
-  try {
-    const r = await clientify.get(`/users/${userId}/`);
-    return r.status >= 200 && r.status < 300;
-  } catch {
-    return false;
-  }
+/* ───────────── Users / Owners ───────────── */
+async function getUserById(userId) {
+  const r = await clientify.get(`/users/${userId}/`);
+  if (r.status >= 200 && r.status < 300) return r.data || null;
+  return null;
+}
+async function getUserEmail(userId) {
+  const u = await getUserById(userId);
+  return u?.email || null;
+}
+async function getUserDisplay(userId) {
+  const u = await getUserById(userId);
+  if (!u) return { id: userId, email: null, name: null, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || u.name || null;
+  return { id: String(userId), email: u.email || null, name, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
 }
 
-// Extrae owner id de un objeto devuelto por la API
-function extractOwnerIdFromObj(obj) {
-  const cand = obj?.owner ?? obj?.user ?? obj?.assigned_to ?? obj?.owner_id ?? obj?.user_id ?? null;
-  if (typeof cand === "number") return String(cand);
-  if (typeof cand === "string") {
-    const m = cand.match(/\/users\/(\d+)\/?$/);
-    return m ? m[1] : (/^\d+$/.test(cand) ? cand : null);
+/*  Extrae owner de respuestas (id + email si están) */
+function extractOwner(obj) {
+  if (!obj || typeof obj !== "object") return { id: null, email: null, name: null };
+
+  // 1º: si hay owner_id numérico, úsalo
+  if (typeof obj.owner_id === "number") return { id: String(obj.owner_id), email: obj.owner || null, name: obj.owner_name || null };
+  if (typeof obj.owner_id === "string" && /^\d+$/.test(obj.owner_id)) return { id: obj.owner_id, email: obj.owner || null, name: obj.owner_name || null };
+
+  // 2º: si hay "owner" como URL / id / email
+  const own = obj.owner ?? obj.user ?? obj.assigned_to ?? null;
+  if (typeof own === "string") {
+    const m = own.match(/\/users\/(\d+)\/?$/);
+    if (m) return { id: m[1], email: null, name: obj.owner_name || null };
+    if (/^\d+$/.test(own)) return { id: own, email: null, name: obj.owner_name || null };
+    if (own.includes("@")) return { id: null, email: own, name: obj.owner_name || null }; // email
   }
-  if (cand && typeof cand === "object") {
-    if (typeof cand.id === "number" || typeof cand.id === "string") return String(cand.id);
-    if (cand.url && typeof cand.url === "string") {
-      const m2 = cand.url.match(/\/users\/(\d+)\/?$/);
-      if (m2) return m2[1];
+  if (own && typeof own === "object") {
+    if (own.id) return { id: String(own.id), email: own.email || null, name: own.name || obj.owner_name || null };
+    if (own.url && typeof own.url === "string") {
+      const m2 = own.url.match(/\/users\/(\d+)\/?$/);
+      if (m2) return { id: m2[1], email: own.email || null, name: own.name || obj.owner_name || null };
     }
   }
-  return null;
+  return { id: null, email: null, name: obj.owner_name || null };
 }
 
 async function readContactOwner(contactId) {
   const r = await clientify.get(`/contacts/${contactId}/`);
-  return { ownerId: (r.status>=200 && r.status<300) ? extractOwnerIdFromObj(r.data||{}) : null, raw: r.data };
+  if (!(r.status >= 200 && r.status < 300)) return { id: null, email: null, name: null, raw: r.data };
+  return { ...extractOwner(r.data || {}), raw: r.data };
 }
 async function readDealOwner(dealId) {
   const r = await clientify.get(`/deals/${dealId}/`);
-  return { ownerId: (r.status>=200 && r.status<300) ? extractOwnerIdFromObj(r.data||{}) : null, raw: r.data };
+  if (!(r.status >= 200 && r.status < 300)) return { id: null, email: null, name: null, raw: r.data };
+  return { ...extractOwner(r.data || {}), raw: r.data };
 }
 
-// PATCH genérico: prueba varias claves/formatos y verifica por GET
-async function assignOwnerVerified({ kind, id, targetOwnerId, readFn }) {
-  const base = CLIENTIFY_BASE.replace(/\/$/, "");
-  const ownerUrl = `${base}/users/${targetOwnerId}/`;
-
-  // Orden pensado para Clientify: primero owner_id numérico
-  const attempts = [
-    { key: "owner_id", value: Number(targetOwnerId), valueType: "id" },
-    { key: "owner",    value: Number(targetOwnerId), valueType: "id" },
-    { key: "user_id",  value: Number(targetOwnerId), valueType: "id" },
-    { key: "user",     value: Number(targetOwnerId), valueType: "id" },
-    { key: "owner",    value: ownerUrl,              valueType: "url" },
-    { key: "user",     value: ownerUrl,              valueType: "url" }
-  ];
-
+/* PATCH genérico: prioriza EMAIL en 'owner' y verifica */
+async function assignOwnerByEmail(kind, id, email) {
   const tried = [];
+  const attempts = [
+    { key: "owner", value: email, valueType: "email" }, // ← principal en tu cuenta
+    { key: "user",  value: email, valueType: "email" }
+  ];
   for (const a of attempts) {
     try {
       const r = await clientify.patch(`/${kind}/${id}/`, { [a.key]: a.value });
       tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
-      // tras cualquier 2xx, verificamos por GET; si no queda, seguimos
       if (r.status >= 200 && r.status < 300) {
         await sleep(250);
-        const read = await readFn(id);
-        if (read.ownerId === String(targetOwnerId)) {
+        const read = kind === "contacts" ? await readContactOwner(id) : await readDealOwner(id);
+        // valida por email (algunas respuestas no devuelven id en deals)
+        if (read.email === email) {
           return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
         }
       }
@@ -201,15 +207,13 @@ async function assignOwnerVerified({ kind, id, targetOwnerId, readFn }) {
   return { ok: false, tried, winner: null };
 }
 
-/* ───────────── Deal helpers ───────────── */
-
-// Crea el deal SIN owner; la herencia del contacto evita reglas que pisen el owner
-async function createDealNoOwner({ contactId, name, amount = 0, stageId, fecha }) {
+/* Crea deal (sin owner) */
+async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
   const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
   const body = { name, contact: contactUrl, stage: stageId, amount, expected_close_date: fecha || null };
   const r = await clientify.post("/deals/", body);
   if (r.status >= 200 && r.status < 300) return r.data;
-  throw new Error(`createDealNoOwner → ${r.status} ${JSON.stringify(r.data)}`);
+  throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
 /* ───────────── Validaciones ───────────── */
@@ -293,43 +297,41 @@ export default async function handler(req, res) {
     const agentIds = getAgentIds();
     const intendedOwnerId = agentIds.length ? pickByHash(contact.id, agentIds) : null;
 
-    // Valida que el usuario exista; si no, gira al siguiente
-    let chosenOwner = intendedOwnerId;
-    if (chosenOwner) {
-      let idx = agentIds.indexOf(String(chosenOwner));
+    // Resolvemos EMAIL del usuario elegido
+    let chosenOwnerId = intendedOwnerId || null;
+    let chosenOwnerEmail = null;
+    if (chosenOwnerId) {
+      // si falla el usuario (borrado), rotamos
+      let idx = agentIds.indexOf(String(chosenOwnerId));
       let loops = 0;
-      while (loops < agentIds.length && !(await userExists(chosenOwner))) {
+      while (loops < agentIds.length) {
+        const emailTry = await getUserEmail(agentIds[idx]);
+        if (emailTry) { chosenOwnerId = agentIds[idx]; chosenOwnerEmail = emailTry; break; }
         idx = (idx + 1) % agentIds.length;
-        chosenOwner = agentIds[idx];
         loops++;
       }
-      if (loops >= agentIds.length) chosenOwner = null; // ninguno válido
+      if (!chosenOwnerEmail) { chosenOwnerId = null; }
     }
 
-    /* ─── Asignar owner al CONTACTO (verificado) ─── */
-    let contactAssign = null, contactOwner = null;
-    if (chosenOwner) {
-      contactAssign = await assignOwnerVerified({
-        kind: "contacts",
-        id: contact.id,
-        targetOwnerId: chosenOwner,
-        readFn: readContactOwner
-      });
+    /* ─── Asignar owner al CONTACTO por EMAIL ─── */
+    let contactAssign = null, contactOwnerAfter = null;
+    if (chosenOwnerEmail) {
+      contactAssign = await assignOwnerByEmail("contacts", contact.id, chosenOwnerEmail);
       await sleep(250);
-      contactOwner = await readContactOwner(contact.id);
+      contactOwnerAfter = await readContactOwner(contact.id);
     } else {
-      contactOwner = await readContactOwner(contact.id);
+      contactOwnerAfter = await readContactOwner(contact.id);
     }
 
-    /* ─── Crear DEAL SIN owner (herencia) ─── */
+    /* ─── Crear DEAL ─── */
     const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
-    let deal = null, dealOwner = null, dealPatch = null;
+    let deal = null, dealOwnerAfter = null, dealPatch = null;
 
     if (stageId) {
       const amount = process.env.DEFAULT_DEAL_AMOUNT ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
       const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
 
-      deal = await createDealNoOwner({
+      deal = await createDeal({
         contactId: contact.id,
         name: dealName,
         amount,
@@ -338,18 +340,13 @@ export default async function handler(req, res) {
       });
 
       await sleep(300);
-      dealOwner = await readDealOwner(deal.id);
+      dealOwnerAfter = await readDealOwner(deal.id);
 
-      // Si no heredó o heredó otro, reforzamos con PATCH verificado
-      if (chosenOwner && dealOwner.ownerId !== String(chosenOwner)) {
-        dealPatch = await assignOwnerVerified({
-          kind: "deals",
-          id: deal.id,
-          targetOwnerId: chosenOwner,
-          readFn: readDealOwner
-        });
+      // Si no heredó el email del contacto, lo forzamos por PATCH (email)
+      if (chosenOwnerEmail && dealOwnerAfter.email !== chosenOwnerEmail) {
+        dealPatch = await assignOwnerByEmail("deals", deal.id, chosenOwnerEmail);
         await sleep(300);
-        dealOwner = await readDealOwner(deal.id);
+        dealOwnerAfter = await readDealOwner(deal.id);
       }
     } else {
       console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
@@ -362,20 +359,26 @@ export default async function handler(req, res) {
       contactId: contact.id,
       dealId: deal?.id || null,
 
-      // Propietarios efectivos
-      contactOwnerId: contactOwner?.ownerId || null,
-      dealOwnerId: dealOwner?.ownerId || null,
+      // Propietarios efectivos (lo que devuelve Clientify)
+      contactOwnerId: contactOwnerAfter?.id || null,
+      contactOwnerEmail: contactOwnerAfter?.email || null,
+      contactOwnerName: contactOwnerAfter?.name || null,
+
+      dealOwnerId: dealOwnerAfter?.id || null,          // puede no venir en deals
+      dealOwnerEmail: dealOwnerAfter?.email || null,    // ← fiable en tu cuenta
+      dealOwnerName: dealOwnerAfter?.name || null,
 
       // Reparto previsto y elegido
       intendedOwnerId: intendedOwnerId || null,
-      chosenOwnerId: chosenOwner || null,
+      chosenOwnerId: chosenOwnerId || null,
+      chosenOwnerEmail: chosenOwnerEmail || null,
 
       // Trazas útiles
       debug: {
         contactAssign,
-        contactOwnerAfter: contactOwner,
-        dealPatch: dealPatch,
-        dealOwnerAfter: dealOwner
+        contactOwnerAfter,
+        dealPatch,
+        dealOwnerAfter
       }
     });
 
@@ -389,4 +392,5 @@ export default async function handler(req, res) {
     });
   }
 }
+
 
