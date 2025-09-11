@@ -1,12 +1,13 @@
 /****************************************************************
 *  ElevenLabs → Clientify
 *  Crea SIEMPRE un contacto nuevo, añade nota y campos
-*  personalizados, y crea un Deal asociado en el stage indicado.
-*  ➕ Reparte el deal entre agentes (owner) y lo devuelve en la respuesta.
+*  personalizados, y crea un Deal en el stage indicado.
+*  ➕ Asigna el deal a un agente (owner) de forma determinista
+*     y valida que el owner quedó aplicado en Clientify.
 ****************************************************************/
 import axios from "axios";
 
-/* ───────────── Utilidades generales ───────────── */
+/* ───────────── Utils generales ───────────── */
 function isDryRun(req) {
   return (
     process.env.DRY_RUN === "true" ||
@@ -51,6 +52,7 @@ const normalizeInt = (v) => (v === undefined || v === null || v === "" ? undefin
   (n => Number.isFinite(n) ? n : undefined)(Number(String(v).replace(/[^\d.-]/g, ""))));
 
 const cleanDate = (v) => v ? String(v).trim() : undefined;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /* ───────────── Config Clientify ───────────── */
 const CLIENTIFY_BASE = process.env.CLIENTIFY_BASE_URL?.trim() || "https://api.clientify.net/v1";
@@ -117,66 +119,6 @@ async function updateCustomFields(contactId, map) {
   await clientify.patch(`/contacts/${contactId}/`, payload);
 }
 
-/* ───────────── Deal helper (creación sin owner) ─────────────
-   Creamos siempre el deal primero; luego asignamos el owner por PATCH.
-   Esto funciona igual en todas las cuentas y evita incompatibilidades.
----------------------------------------------------------------- */
-async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
-  const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
-
-  const body = {
-    name,
-    contact: contactUrl,  // Clientify quiere la URL del contacto
-    stage  : stageId,
-    amount ,
-    expected_close_date: fecha || null
-  };
-
-  const r = await clientify.post("/deals/", body);
-  if (r.status >= 200 && r.status < 300) return r.data;
-  throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
-}
-
-/* ───────────── Asignación de owner (multi-intento) ─────────────
-   Probamos varias combinaciones comunes, devolviendo cuál funcionó.
-   Devuelve { ok: boolean, tried: [...], winner: {key, valueType} | null }
------------------------------------------------------------------- */
-async function assignOwnerToDeal(dealId, ownerUserId) {
-  const base = CLIENTIFY_BASE.replace(/\/$/, "");
-  const ownerUrl = `${base}/users/${ownerUserId}/`;
-
-  const attempts = [
-    { key: "owner", value: ownerUrl, valueType: "url" },
-    { key: "user",  value: ownerUrl, valueType: "url" },
-    { key: "owner", value: Number(ownerUserId), valueType: "id" },
-    { key: "user",  value: Number(ownerUserId), valueType: "id" }
-  ];
-
-  const tried = [];
-  for (const a of attempts) {
-    const payload = { [a.key]: a.value };
-    let status = null, data = null;
-    try {
-      const r = await clientify.patch(`/deals/${dealId}/`, payload);
-      status = r.status; data = r.data;
-      tried.push({ key: a.key, valueType: a.valueType, status, data: data?.detail || data?.error || null });
-      if (status >= 200 && status < 300) {
-        return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
-      }
-      // Para 400/404/403/422 seguimos probando
-      if ([400, 403, 404, 409, 422].includes(status)) continue;
-    } catch (e) {
-      status = e.response?.status ?? null;
-      data = e.response?.data ?? e.message;
-      tried.push({ key: a.key, valueType: a.valueType, status, data });
-      // Errores de red u otros → seguimos al siguiente intento
-      continue;
-    }
-  }
-  return { ok: false, tried, winner: null };
-}
-
-
 /* ───────────── Reparto de agentes ─────────────
    Estrategia por defecto: hash determinista (idempotente)
    owner = agentIds[ contactId % agentIds.length ]
@@ -185,31 +127,98 @@ function getAgentIds() {
   const raw = (process.env.CLIENTIFY_AGENT_USER_IDS || "").trim();
   return raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : [];
 }
-
 function pickByHash(contactId, agentIds) {
   if (!agentIds.length) return undefined;
   const n = Number(String(contactId).replace(/[^\d]/g, "")) || 0;
   return agentIds[n % agentIds.length];
 }
 
-/* Devuelve una lista de candidatos en orden de prioridad:
-   empieza por el calculado por hash y sigue rotando por el resto.
-*/
-function candidatesFrom(contactId, agentIds) {
-  if (!agentIds.length) return [];
-  const start = Number(String(contactId).replace(/[^\d]/g, "")) % agentIds.length;
-  return [...agentIds.slice(start), ...agentIds.slice(0, start)];
+/* ───────────── Deal helpers ───────────── */
+
+// Crea el deal; si la cuenta lo admite, lo crea YA con owner
+async function createDealWithOptionalOwner({ contactId, name, amount = 0, stageId, fecha, ownerUserId }) {
+  const base = CLIENTIFY_BASE.replace(/\/$/, "");
+  const contactUrl = `${base}/contacts/${contactId}/`;
+  const ownerUrl   = ownerUserId ? `${base}/users/${ownerUserId}/` : undefined;
+
+  const body = {
+    name,
+    contact: contactUrl,
+    stage  : stageId,
+    amount,
+    expected_close_date: fecha || null,
+    ...(ownerUrl ? { owner: ownerUrl } : {})
+  };
+
+  const r = await clientify.post("/deals/", body);
+  // Si lo aceptó, perfecto
+  if (r.status >= 200 && r.status < 300) return r.data;
+
+  // Si no aceptó owner en POST, reintenta sin owner y devolvemos el deal
+  if ([400, 403, 404, 409, 422].includes(r.status) && ownerUrl) {
+    const r2 = await clientify.post("/deals/", {
+      name,
+      contact: contactUrl,
+      stage: stageId,
+      amount,
+      expected_close_date: fecha || null
+    });
+    if (r2.status >= 200 && r2.status < 300) return r2.data;
+  }
+  throw new Error(`createDealWithOptionalOwner → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-async function resolveOwnerCandidate(contactId) {
-  const agentIds = getAgentIds();
-  const strategy = (process.env.ASSIGNMENT_STRATEGY || "hash").toLowerCase();
-  if (strategy === "hash") return { chosen: pickByHash(contactId, agentIds), list: candidatesFrom(contactId, agentIds) };
-  // Futuras estrategias: rr, weighted, rules, load...
-  return { chosen: pickByHash(contactId, agentIds), list: candidatesFrom(contactId, agentIds) };
+// PATCH con varias variantes (owner/user + url/id)
+async function assignOwnerToDeal(dealId, ownerUserId) {
+  const base = CLIENTIFY_BASE.replace(/\/$/, "");
+  const ownerUrl = `${base}/users/${ownerUserId}/`;
+  const attempts = [
+    { key: "owner", value: ownerUrl, valueType: "url" },
+    { key: "user",  value: ownerUrl, valueType: "url" },
+    { key: "owner", value: Number(ownerUserId), valueType: "id" },
+    { key: "user",  value: Number(ownerUserId), valueType: "id" }
+  ];
+  const tried = [];
+  for (const a of attempts) {
+    const payload = { [a.key]: a.value };
+    try {
+      const r = await clientify.patch(`/deals/${dealId}/`, payload);
+      tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
+      if (r.status >= 200 && r.status < 300) {
+        return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
+      }
+    } catch (e) {
+      tried.push({ key: a.key, valueType: a.valueType, status: e.response?.status || null, data: e.response?.data || e.message });
+    }
+  }
+  return { ok: false, tried, winner: null };
 }
 
-/* (Opcional) Nombre del usuario para la respuesta. No hace fallar si algo va mal. */
+// Lee el deal y devuelve ownerId si está presente (parseando URL)
+async function readDealOwner(dealId) {
+  const r = await clientify.get(`/deals/${dealId}/`);
+  if (!(r.status >= 200 && r.status < 300)) return { ownerId: null, raw: r.data };
+  const d = r.data || {};
+  // owner puede venir como URL (".../users/245725/") o como obj/prop
+  const ownerUrl = d.owner || d.user || d.assigned_to || null;
+  if (typeof ownerUrl === "string") {
+    const m = ownerUrl.match(/\/users\/(\d+)\/?$/);
+    return { ownerId: m ? m[1] : null, raw: d };
+  }
+  // si viniera como id numérico:
+  if (typeof ownerUrl === "number") return { ownerId: String(ownerUrl), raw: d };
+  if (ownerUrl && typeof ownerUrl === "object") {
+    // en caso de objeto con { url } o { id }
+    if (ownerUrl.url && typeof ownerUrl.url === "string") {
+      const m2 = ownerUrl.url.match(/\/users\/(\d+)\/?$/);
+      return { ownerId: m2 ? m2[1] : null, raw: d };
+    }
+    if (ownerUrl.id) return { ownerId: String(ownerUrl.id), raw: d };
+  }
+  return { ownerId: null, raw: d };
+}
+
+// best-effort para nombre/email del usuario
 async function getUserDisplay(userId) {
   try {
     const r = await clientify.get(`/users/${userId}/`);
@@ -219,7 +228,7 @@ async function getUserDisplay(userId) {
       const email = u.email || null;
       return { name, email, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
     }
-  } catch (_e) { /* noop */ }
+  } catch (_e) {}
   return { name: null, email: null, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
 }
 
@@ -305,76 +314,73 @@ export default async function handler(req, res) {
       urgencia : urgencia_compra
     });
 
+    /* ─── Reparto: elegimos el owner ANTES de crear el deal ─── */
+    const agentIds = getAgentIds();
+    const intendedOwnerId = agentIds.length ? pickByHash(contact.id, agentIds) : null;
+
     /* ─── Deal ─── */
-const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
-let assignedOwnerId = null;
-let assignedOwner = null;
-let assignmentDebug = null;
-let deal = null;
+    const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
+    let deal = null;
+    let assignedOwnerId = null;
+    let assignedOwner = null;
+    let assignmentDebug = { intendedOwnerId, steps: [] };
 
-if (stageId) {
-  const amount = process.env.DEFAULT_DEAL_AMOUNT
-    ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
-  const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
+    if (stageId) {
+      const amount = process.env.DEFAULT_DEAL_AMOUNT
+        ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
+      const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
 
-  // ① Crear el deal primero (máxima compatibilidad)
-  deal = await createDeal({
-    contactId: contact.id,
-    name: dealName,
-    amount,
-    stageId,
-    fecha: cleanDate(fecha_crucero)
-  });
+      // ① Intentar crear con owner en POST
+      deal = await createDealWithOptionalOwner({
+        contactId: contact.id,
+        name: dealName,
+        amount,
+        stageId,
+        fecha: cleanDate(fecha_crucero),
+        ownerUserId: intendedOwnerId || undefined
+      });
+      assignmentDebug.steps.push({ step: "post_with_owner", dealId: deal.id, intendedOwnerId });
 
-  // ② Cargar agentes y construir candidatos
-  const agentIds = (process.env.CLIENTIFY_AGENT_USER_IDS || "")
-    .split(",").map(s => s.trim()).filter(Boolean);
-  if (!agentIds.length) {
-    assignmentDebug = { reason: "no_agent_ids_in_env" };
-  } else {
-    const start = Number(String(contact.id).replace(/[^\d]/g, "")) % agentIds.length;
-    const candidates = [...agentIds.slice(start), ...agentIds.slice(0, start)];
+      // ② Espera corta y verifica el owner real
+      await sleep(300);
+      let read1 = await readDealOwner(deal.id);
+      assignmentDebug.readAfterPost = { ownerId: read1.ownerId };
 
-    // ③ Probar asignación con cada candidato hasta que una funcione
-    for (const uid of candidates) {
-      const res = await assignOwnerToDeal(deal.id, uid);
-      assignmentDebug = { ...(assignmentDebug || {}), lastTried: res.tried };
-      if (res.ok) {
-        assignedOwnerId = uid;
-        assignedOwner = await getUserDisplay(uid); // best-effort
-        assignmentDebug.winner = res.winner;
-        break;
+      // ③ Si no coincide con el previsto (o está vacío), parchea y re-verifica
+      if (!read1.ownerId || (intendedOwnerId && read1.ownerId !== String(intendedOwnerId))) {
+        if (intendedOwnerId) {
+          const patchRes = await assignOwnerToDeal(deal.id, intendedOwnerId);
+          assignmentDebug.patchAfterPost = patchRes;
+          await sleep(300);
+          read1 = await readDealOwner(deal.id);
+          assignmentDebug.readAfterPatch = { ownerId: read1.ownerId };
+        }
       }
+
+      assignedOwnerId = (await readDealOwner(deal.id)).ownerId || null;
+      if (assignedOwnerId) {
+        assignedOwner = await getUserDisplay(assignedOwnerId);
+      }
+    } else {
+      console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
     }
-
-    if (!assignedOwnerId) {
-      assignmentDebug = assignmentDebug || {};
-      assignmentDebug.message = "no_candidate_worked";
-      assignmentDebug.candidates = candidates;
-    }
-  }
-
-  console.log("✅ deal", deal.id, "→ owner", assignedOwnerId || "(sin owner)");
-} else {
-  console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
-}
-
 
     /* ─── Respuesta ─── */
     return res.status(200).json({
-  ok: true,
-  base: CLIENTIFY_BASE,
-  contactId: contact.id,
-  dealId: deal?.id || null,
-  assignedOwnerId,
-  assignedOwnerUrl: assignedOwnerId
-    ? `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${assignedOwnerId}/`
-    : null,
-  assignedOwnerName: assignedOwner?.name || null,
-  assignedOwnerEmail: assignedOwner?.email || null,
-  assignmentDebug
-});
-
+      ok: true,
+      base: CLIENTIFY_BASE,
+      contactId: contact.id,
+      dealId: deal?.id || null,
+      // Lo que realmente quedó en Clientify:
+      assignedOwnerId,
+      assignedOwnerUrl: assignedOwnerId
+        ? `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${assignedOwnerId}/`
+        : null,
+      assignedOwnerName: assignedOwner?.name || null,
+      assignedOwnerEmail: assignedOwner?.email || null,
+      // Para depurar si una automatización te lo pisa:
+      assignmentDebug
+    });
 
   } catch (e) {
     console.error("ERROR", e.response?.status, e.response?.config?.url, e.response?.data || e.message);
