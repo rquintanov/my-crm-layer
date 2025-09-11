@@ -137,18 +137,45 @@ async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
   throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-/* ───────────── Asignación de owner (por PATCH) ───────────── */
+/* ───────────── Asignación de owner (multi-intento) ─────────────
+   Probamos varias combinaciones comunes, devolviendo cuál funcionó.
+   Devuelve { ok: boolean, tried: [...], winner: {key, valueType} | null }
+------------------------------------------------------------------ */
 async function assignOwnerToDeal(dealId, ownerUserId) {
-  const ownerUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${ownerUserId}/`;
-  const r = await clientify.patch(`/deals/${dealId}/`, { owner: ownerUrl });
-  if (r.status >= 200 && r.status < 300) return true;
+  const base = CLIENTIFY_BASE.replace(/\/$/, "");
+  const ownerUrl = `${base}/users/${ownerUserId}/`;
 
-  // Si el user no existe o no es válido, devolvemos false para probar el siguiente
-  if (r.status === 400 || r.status === 404) return false;
+  const attempts = [
+    { key: "owner", value: ownerUrl, valueType: "url" },
+    { key: "user",  value: ownerUrl, valueType: "url" },
+    { key: "owner", value: Number(ownerUserId), valueType: "id" },
+    { key: "user",  value: Number(ownerUserId), valueType: "id" }
+  ];
 
-  // Cualquier otro error lo propagamos
-  throw new Error(`assignOwnerToDeal → ${r.status} ${JSON.stringify(r.data)}`);
+  const tried = [];
+  for (const a of attempts) {
+    const payload = { [a.key]: a.value };
+    let status = null, data = null;
+    try {
+      const r = await clientify.patch(`/deals/${dealId}/`, payload);
+      status = r.status; data = r.data;
+      tried.push({ key: a.key, valueType: a.valueType, status, data: data?.detail || data?.error || null });
+      if (status >= 200 && status < 300) {
+        return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
+      }
+      // Para 400/404/403/422 seguimos probando
+      if ([400, 403, 404, 409, 422].includes(status)) continue;
+    } catch (e) {
+      status = e.response?.status ?? null;
+      data = e.response?.data ?? e.message;
+      tried.push({ key: a.key, valueType: a.valueType, status, data });
+      // Errores de red u otros → seguimos al siguiente intento
+      continue;
+    }
+  }
+  return { ok: false, tried, winner: null };
 }
+
 
 /* ───────────── Reparto de agentes ─────────────
    Estrategia por defecto: hash determinista (idempotente)
@@ -279,60 +306,75 @@ export default async function handler(req, res) {
     });
 
     /* ─── Deal ─── */
-    const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
-    let assignedOwnerId = null;
-    let assignedOwner = null;
-    let deal = null;
+const stageId = process.env.CLIENTIFY_DEAL_STAGE_ID;
+let assignedOwnerId = null;
+let assignedOwner = null;
+let assignmentDebug = null;
+let deal = null;
 
-    if (stageId) {
-      const amount = process.env.DEFAULT_DEAL_AMOUNT
-        ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
-      const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
+if (stageId) {
+  const amount = process.env.DEFAULT_DEAL_AMOUNT
+    ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
+  const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
 
-      // ① Primero creamos el deal (sin owner para máxima compatibilidad)
-      deal = await createDeal({
-        contactId: contact.id,
-        name: dealName,
-        amount,
-        stageId,
-        fecha: cleanDate(fecha_crucero)
-      });
+  // ① Crear el deal primero (máxima compatibilidad)
+  deal = await createDeal({
+    contactId: contact.id,
+    name: dealName,
+    amount,
+    stageId,
+    fecha: cleanDate(fecha_crucero)
+  });
 
-      // ② Calculamos candidatos y vamos probando hasta asignar uno válido
-      const { list: candidates } = await resolveOwnerCandidate(contact.id);
-      for (const userId of candidates) {
-        try {
-          const ok = await assignOwnerToDeal(deal.id, userId);
-          if (ok) {
-            assignedOwnerId = userId;
-            assignedOwner = await getUserDisplay(userId); // nombre/email si está disponible
-            break;
-          }
-        } catch (e) {
-          // Errores no "owner inválido": registra y corta (evita bucle)
-          console.error("assignOwnerToDeal ERROR", e.message);
-          break;
-        }
+  // ② Cargar agentes y construir candidatos
+  const agentIds = (process.env.CLIENTIFY_AGENT_USER_IDS || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  if (!agentIds.length) {
+    assignmentDebug = { reason: "no_agent_ids_in_env" };
+  } else {
+    const start = Number(String(contact.id).replace(/[^\d]/g, "")) % agentIds.length;
+    const candidates = [...agentIds.slice(start), ...agentIds.slice(0, start)];
+
+    // ③ Probar asignación con cada candidato hasta que una funcione
+    for (const uid of candidates) {
+      const res = await assignOwnerToDeal(deal.id, uid);
+      assignmentDebug = { ...(assignmentDebug || {}), lastTried: res.tried };
+      if (res.ok) {
+        assignedOwnerId = uid;
+        assignedOwner = await getUserDisplay(uid); // best-effort
+        assignmentDebug.winner = res.winner;
+        break;
       }
-
-      console.log("✅ deal", deal.id, "→ owner", assignedOwnerId || "(sin owner)");
-    } else {
-      console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
     }
+
+    if (!assignedOwnerId) {
+      assignmentDebug = assignmentDebug || {};
+      assignmentDebug.message = "no_candidate_worked";
+      assignmentDebug.candidates = candidates;
+    }
+  }
+
+  console.log("✅ deal", deal.id, "→ owner", assignedOwnerId || "(sin owner)");
+} else {
+  console.warn("CLIENTIFY_DEAL_STAGE_ID no definido → no se crea deal");
+}
+
 
     /* ─── Respuesta ─── */
     return res.status(200).json({
-      ok: true,
-      base: CLIENTIFY_BASE,
-      contactId: contact.id,
-      dealId: deal?.id || null,
-      assignedOwnerId,
-      assignedOwnerUrl: assignedOwnerId
-        ? `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${assignedOwnerId}/`
-        : null,
-      assignedOwnerName: assignedOwner?.name || null,
-      assignedOwnerEmail: assignedOwner?.email || null
-    });
+  ok: true,
+  base: CLIENTIFY_BASE,
+  contactId: contact.id,
+  dealId: deal?.id || null,
+  assignedOwnerId,
+  assignedOwnerUrl: assignedOwnerId
+    ? `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${assignedOwnerId}/`
+    : null,
+  assignedOwnerName: assignedOwner?.name || null,
+  assignedOwnerEmail: assignedOwner?.email || null,
+  assignmentDebug
+});
+
 
   } catch (e) {
     console.error("ERROR", e.response?.status, e.response?.config?.url, e.response?.data || e.message);
