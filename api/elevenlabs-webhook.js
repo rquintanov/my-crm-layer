@@ -1,15 +1,15 @@
 /****************************************************************
 * ElevenLabs → Clientify
 * - Crea SIEMPRE un contacto nuevo, añade nota y campos
-* - Asigna propietario por EMAIL (owner) al CONTACTO (verificado)
-* - Crea Deal y lo asigna por EMAIL (owner) si hace falta (verificado)
-* - Devuelve owner efectivo (id + email + nombre) y trazas
+* - Reparte por hash y asigna OWNER por EMAIL al CONTACTO
+* - Crea el DEAL y, si no hereda, fuerza OWNER por EMAIL
+* - Devuelve owners efectivos + trazas
 ****************************************************************/
 import axios from "axios";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ───────────── Utils entrada ───────────── */
+/* ───────────── Helpers de entrada ───────────── */
 function isDryRun(req) {
   return (
     process.env.DRY_RUN === "true" ||
@@ -74,7 +74,7 @@ const CF_IDS = {
   urgencia: process.env.CLIENTIFY_CF_URGENCIA_ID || ""
 };
 
-/* ───────────── Helpers Contact ───────────── */
+/* ───────────── API helpers ───────────── */
 async function createContact({ first_name, last_name, email, phone, source, tags = [], summary }) {
   const safeTags =
     Array.isArray(tags)
@@ -82,28 +82,18 @@ async function createContact({ first_name, last_name, email, phone, source, tags
       : typeof tags === "string"
           ? tags.split(",").map(t => t.trim()).filter(Boolean)
           : [];
-
-  const body = {
-    first_name,
-    last_name,
-    email,
-    phone,
+  const r = await clientify.post("/contacts/", {
+    first_name, last_name, email, phone,
     contact_source: source || "AI Agent",
-    tags: safeTags,
-    summary: summary || ""
-  };
-
-  const r = await clientify.post("/contacts/", body);
+    tags: safeTags, summary: summary || ""
+  });
   if (r.status >= 200 && r.status < 300) return r.data;
   throw new Error(`createContact → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
 async function addNote(contactId, text) {
   if (!text) return;
-  await clientify.post(`/contacts/${contactId}/note/`, {
-    name: "Datos del Agente",
-    comment: text
-  });
+  await clientify.post(`/contacts/${contactId}/note/`, { name: "Datos del Agente", comment: text });
 }
 
 async function updateCustomFields(contactId, map) {
@@ -111,54 +101,30 @@ async function updateCustomFields(contactId, map) {
     .map(([k, v]) => ({ id: CF_IDS[k], value: v }))
     .filter(e => e.id && e.value !== undefined && e.value !== null && e.value !== "");
   if (!entries.length) return;
-
   const payload = { custom_fields_values: entries.map(e => ({ id: e.id, value: String(e.value) })) };
   await clientify.patch(`/contacts/${contactId}/`, payload);
 }
 
-/* ───────────── Reparto ───────────── */
-function getAgentIds() {
-  const raw = (process.env.CLIENTIFY_AGENT_USER_IDS || "").trim();
-  return raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : [];
-}
-function pickByHash(contactId, agentIds) {
-  if (!agentIds.length) return undefined;
-  const n = Number(String(contactId).replace(/[^\d]/g, "")) || 0;
-  return agentIds[n % agentIds.length];
+async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
+  const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
+  const r = await clientify.post("/deals/", {
+    name, contact: contactUrl, stage: stageId, amount, expected_close_date: fecha || null
+  });
+  if (r.status >= 200 && r.status < 300) return r.data;
+  throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
 }
 
-/* ───────────── Users / Owners ───────────── */
-async function getUserById(userId) {
-  const r = await clientify.get(`/users/${userId}/`);
-  if (r.status >= 200 && r.status < 300) return r.data || null;
-  return null;
-}
-async function getUserEmail(userId) {
-  const u = await getUserById(userId);
-  return u?.email || null;
-}
-async function getUserDisplay(userId) {
-  const u = await getUserById(userId);
-  if (!u) return { id: userId, email: null, name: null, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
-  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || u.name || null;
-  return { id: String(userId), email: u.email || null, name, url: `${CLIENTIFY_BASE.replace(/\/$/, "")}/users/${userId}/` };
-}
-
-/*  Extrae owner de respuestas (id + email si están) */
+/* Leer owners (id + email + name si vienen) */
 function extractOwner(obj) {
   if (!obj || typeof obj !== "object") return { id: null, email: null, name: null };
-
-  // 1º: si hay owner_id numérico, úsalo
   if (typeof obj.owner_id === "number") return { id: String(obj.owner_id), email: obj.owner || null, name: obj.owner_name || null };
   if (typeof obj.owner_id === "string" && /^\d+$/.test(obj.owner_id)) return { id: obj.owner_id, email: obj.owner || null, name: obj.owner_name || null };
-
-  // 2º: si hay "owner" como URL / id / email
   const own = obj.owner ?? obj.user ?? obj.assigned_to ?? null;
   if (typeof own === "string") {
     const m = own.match(/\/users\/(\d+)\/?$/);
     if (m) return { id: m[1], email: null, name: obj.owner_name || null };
     if (/^\d+$/.test(own)) return { id: own, email: null, name: obj.owner_name || null };
-    if (own.includes("@")) return { id: null, email: own, name: obj.owner_name || null }; // email
+    if (own.includes("@")) return { id: null, email: own, name: obj.owner_name || null };
   }
   if (own && typeof own === "object") {
     if (own.id) return { id: String(own.id), email: own.email || null, name: own.name || obj.owner_name || null };
@@ -169,51 +135,43 @@ function extractOwner(obj) {
   }
   return { id: null, email: null, name: obj.owner_name || null };
 }
-
 async function readContactOwner(contactId) {
   const r = await clientify.get(`/contacts/${contactId}/`);
-  if (!(r.status >= 200 && r.status < 300)) return { id: null, email: null, name: null, raw: r.data };
-  return { ...extractOwner(r.data || {}), raw: r.data };
+  return (r.status >= 200 && r.status < 300) ? { ...extractOwner(r.data||{}), raw: r.data } : { id:null, email:null, name:null, raw:r.data };
 }
 async function readDealOwner(dealId) {
   const r = await clientify.get(`/deals/${dealId}/`);
-  if (!(r.status >= 200 && r.status < 300)) return { id: null, email: null, name: null, raw: r.data };
-  return { ...extractOwner(r.data || {}), raw: r.data };
+  return (r.status >= 200 && r.status < 300) ? { ...extractOwner(r.data||{}), raw: r.data } : { id:null, email:null, name:null, raw:r.data };
 }
 
-/* PATCH genérico: prioriza EMAIL en 'owner' y verifica */
+/* PATCH owner por EMAIL (lo que tu cuenta acepta) y verifica por GET */
 async function assignOwnerByEmail(kind, id, email) {
   const tried = [];
-  const attempts = [
-    { key: "owner", value: email, valueType: "email" }, // ← principal en tu cuenta
-    { key: "user",  value: email, valueType: "email" }
-  ];
-  for (const a of attempts) {
+  for (const key of ["owner","user"]) {
     try {
-      const r = await clientify.patch(`/${kind}/${id}/`, { [a.key]: a.value });
-      tried.push({ key: a.key, valueType: a.valueType, status: r.status, data: r.data?.detail || null });
+      const r = await clientify.patch(`/${kind}/${id}/`, { [key]: email });
+      tried.push({ key, valueType: "email", status: r.status, data: r.data?.detail || null });
       if (r.status >= 200 && r.status < 300) {
         await sleep(250);
         const read = kind === "contacts" ? await readContactOwner(id) : await readDealOwner(id);
-        // valida por email (algunas respuestas no devuelven id en deals)
-        if (read.email === email) {
-          return { ok: true, tried, winner: { key: a.key, valueType: a.valueType } };
-        }
+        if (read.email === email) return { ok: true, tried, winner: { key, valueType: "email" } };
       }
     } catch (e) {
-      tried.push({ key: a.key, valueType: a.valueType, status: e.response?.status || null, data: e.response?.data || e.message });
+      tried.push({ key, valueType: "email", status: e.response?.status || null, data: e.response?.data || e.message });
     }
   }
   return { ok: false, tried, winner: null };
 }
 
-/* Crea deal (sin owner) */
-async function createDeal({ contactId, name, amount = 0, stageId, fecha }) {
-  const contactUrl = `${CLIENTIFY_BASE.replace(/\/$/, "")}/contacts/${contactId}/`;
-  const body = { name, contact: contactUrl, stage: stageId, amount, expected_close_date: fecha || null };
-  const r = await clientify.post("/deals/", body);
-  if (r.status >= 200 && r.status < 300) return r.data;
-  throw new Error(`createDeal → ${r.status} ${JSON.stringify(r.data)}`);
+/* ───────────── Reparto (por EMAIL) ───────────── */
+function getAgentEmails() {
+  const raw = (process.env.CLIENTIFY_AGENT_EMAILS || "").trim();
+  return raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : [];
+}
+function pickEmailByHash(contactId, emails) {
+  if (!emails.length) return null;
+  const n = Number(String(contactId).replace(/[^\d]/g, "")) || 0;
+  return emails[n % emails.length];
 }
 
 /* ───────────── Validaciones ───────────── */
@@ -236,23 +194,20 @@ export default async function handler(req, res) {
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
     if (!TOKEN) return res.status(500).json({ error: "CLIENTIFY_TOKEN no definido" });
 
+    // Firma simple (opcional)
     if (process.env.ELEVENLABS_SECRET &&
         req.headers["x-elevenlabs-secret"] !== process.env.ELEVENLABS_SECRET) {
       return res.status(401).json({ error: "Invalid signature" });
     }
 
     const envelope = wrapIfFlat(req.body);
-    if (isDryRun(req)) {
-      return res.status(200).json({ ok: true, mode: "dry-run", received: envelope });
-    }
+    if (isDryRun(req)) return res.status(200).json({ ok: true, mode: "dry-run", received: envelope });
 
     const envErr = validateEnvelope(envelope);
     if (envErr) return res.status(400).json({ error: envErr });
 
     const { intent, payload } = envelope;
-    if (intent !== "create_lead") {
-      return res.status(200).json({ ok: true, message: `Intent '${intent}' no implementado` });
-    }
+    if (intent !== "create_lead") return res.status(200).json({ ok: true, message: `Intent '${intent}' no implementado` });
 
     const pErr = validateLeadPayload(payload);
     if (pErr) return res.status(400).json({ error: pErr });
@@ -264,16 +219,7 @@ export default async function handler(req, res) {
     } = payload;
 
     const { first_name, last_name: ln } = splitName(name, last_name);
-
-    const contact = await createContact({
-      first_name,
-      last_name: ln,
-      email,
-      phone,
-      source,
-      tags,
-      summary
-    });
+    const contact = await createContact({ first_name, last_name: ln, email, phone, source, tags, summary });
 
     const nota =
       `Datos del lead:\n` +
@@ -293,31 +239,19 @@ export default async function handler(req, res) {
       urgencia : urgencia_compra
     });
 
-    /* ─── Reparto ─── */
-    const agentIds = getAgentIds();
-    const intendedOwnerId = agentIds.length ? pickByHash(contact.id, agentIds) : null;
+    /* ─── Reparto por EMAIL ─── */
+    const emails = getAgentEmails();
+    const intendedOwnerEmail = pickEmailByHash(contact.id, emails);
+    let chosenOwnerEmail = intendedOwnerEmail || null;
 
-    // Resolvemos EMAIL del usuario elegido
-    let chosenOwnerId = intendedOwnerId || null;
-    let chosenOwnerEmail = null;
-    if (chosenOwnerId) {
-      // si falla el usuario (borrado), rotamos
-      let idx = agentIds.indexOf(String(chosenOwnerId));
-      let loops = 0;
-      while (loops < agentIds.length) {
-        const emailTry = await getUserEmail(agentIds[idx]);
-        if (emailTry) { chosenOwnerId = agentIds[idx]; chosenOwnerEmail = emailTry; break; }
-        idx = (idx + 1) % agentIds.length;
-        loops++;
-      }
-      if (!chosenOwnerEmail) { chosenOwnerId = null; }
-    }
+    // Si el email elegido está vacío, probamos el siguiente de la lista
+    if (!chosenOwnerEmail && emails.length) chosenOwnerEmail = emails[0];
 
     /* ─── Asignar owner al CONTACTO por EMAIL ─── */
     let contactAssign = null, contactOwnerAfter = null;
     if (chosenOwnerEmail) {
       contactAssign = await assignOwnerByEmail("contacts", contact.id, chosenOwnerEmail);
-      await sleep(250);
+      await sleep(200);
       contactOwnerAfter = await readContactOwner(contact.id);
     } else {
       contactOwnerAfter = await readContactOwner(contact.id);
@@ -331,21 +265,15 @@ export default async function handler(req, res) {
       const amount = process.env.DEFAULT_DEAL_AMOUNT ? Number(process.env.DEFAULT_DEAL_AMOUNT) : 0;
       const dealName = `Crucero: ${destino_crucero || "Destino"} · ${cleanDate(fecha_crucero) || "Fecha"}`;
 
-      deal = await createDeal({
-        contactId: contact.id,
-        name: dealName,
-        amount,
-        stageId,
-        fecha: cleanDate(fecha_crucero)
-      });
+      deal = await createDeal({ contactId: contact.id, name: dealName, amount, stageId, fecha: cleanDate(fecha_crucero) });
 
-      await sleep(300);
+      await sleep(250);
       dealOwnerAfter = await readDealOwner(deal.id);
 
-      // Si no heredó el email del contacto, lo forzamos por PATCH (email)
+      // Si no heredó o heredó otro, forzamos por EMAIL
       if (chosenOwnerEmail && dealOwnerAfter.email !== chosenOwnerEmail) {
         dealPatch = await assignOwnerByEmail("deals", deal.id, chosenOwnerEmail);
-        await sleep(300);
+        await sleep(250);
         dealOwnerAfter = await readDealOwner(deal.id);
       }
     } else {
@@ -359,21 +287,20 @@ export default async function handler(req, res) {
       contactId: contact.id,
       dealId: deal?.id || null,
 
-      // Propietarios efectivos (lo que devuelve Clientify)
+      // Propietarios efectivos (según Clientify)
       contactOwnerId: contactOwnerAfter?.id || null,
       contactOwnerEmail: contactOwnerAfter?.email || null,
       contactOwnerName: contactOwnerAfter?.name || null,
 
-      dealOwnerId: dealOwnerAfter?.id || null,          // puede no venir en deals
-      dealOwnerEmail: dealOwnerAfter?.email || null,    // ← fiable en tu cuenta
+      dealOwnerId: dealOwnerAfter?.id || null,          // puede venir null en deals
+      dealOwnerEmail: dealOwnerAfter?.email || null,    // fiable en tu cuenta
       dealOwnerName: dealOwnerAfter?.name || null,
 
-      // Reparto previsto y elegido
-      intendedOwnerId: intendedOwnerId || null,
-      chosenOwnerId: chosenOwnerId || null,
-      chosenOwnerEmail: chosenOwnerEmail || null,
+      // Reparto
+      intendedOwnerEmail,
+      chosenOwnerEmail,
 
-      // Trazas útiles
+      // Trazas
       debug: {
         contactAssign,
         contactOwnerAfter,
